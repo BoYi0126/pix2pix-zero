@@ -1,6 +1,5 @@
 import torch
 from diffusers.models.attention import CrossAttention
-from diffusers.models.attention import SelfAttention    # BoYi新增，為了使用Self-Attention
 
 class MyCrossAttnProcessor:
     def __call__(
