@@ -182,3 +182,24 @@ def prep_unet(unet):
             #module.set_processor(MyCrossAttnProcessor())
             module.set_processor(MyDualAttnProcessor())
     return unet
+
+
+def prep_unet(unet):
+    # set the gradients for XA maps to be true
+    for name, params in unet.named_parameters():
+        # requires_grad代表哪些參數可以被訓練更新
+        # 改成self-attention跟cross-attention都可以訓練
+        if 'attn1' in name or 'attn2' in name:  
+            params.requires_grad = True
+        else:
+            params.requires_grad = False
+
+    # 替換self-attention跟cross-attention的forward processor
+    # self-attention跟cross-attention都是在CrossAttention類別下，分別在於dim的不同
+    # module.cross_attention_dim == None: self-attention
+    # module.cross_attention_dim == 768: cross-attention
+    for name, module in unet.named_modules():
+        module_name = type(module).__name__
+        if module_name == "CrossAttention":
+            module.set_processor(MyCrossAttnProcessor())
+    return unet
