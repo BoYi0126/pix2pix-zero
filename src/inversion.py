@@ -19,8 +19,12 @@ from utils.scheduler import DDIMInverseScheduler
 # 若有 GPU 則使用 GPU，否則使用 CPU
 if torch.cuda.is_available():
     device = "cuda"
+    print("[inversion.py] Device: CUDA")
+    print("[inversion.py] GPU Name:", torch.cuda.get_device_name(0))
+    print("[inversion.py] CUDA Version:", torch.version.cuda)
 else:
     device = "cpu"
+    print("[inversion.py] CPU")
 
 
 if __name__=="__main__":
