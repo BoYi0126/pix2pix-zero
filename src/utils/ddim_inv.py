@@ -46,22 +46,22 @@ class DDIMInversion(BasePipeline):
 
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
-        num_inversion_steps: int = 50,
-        guidance_scale: float = 7.5,
+        prompt: Union[str, List[str]] = None,   # 文字提示，用於 cross-attention
+        num_inversion_steps: int = 50,  # DDIM 反推步數
+        guidance_scale: float = 7.5, # classifier-free guidance 強度
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,    # 傳入 cross-attention 的額外控制參數（⭐關鍵）
         img=None, # the input image as a PIL image
         torch_dtype=torch.float32,
 
         # inversion regularization parameters
-        lambda_ac: float = 20.0,
-        lambda_kl: float = 20.0,
-        num_reg_steps: int = 5,
+        lambda_ac: float = 20.0,    # inversion正則項
+        lambda_kl: float = 20.0,    # inversion正則項
+        num_reg_steps: int = 5, # 正則迭代次數
         num_ac_rolls: int = 5,
     ):
         
@@ -73,7 +73,7 @@ class DDIMInversion(BasePipeline):
 
         device = self._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
-        self.scheduler.set_timesteps(num_inversion_steps, device=device)
+        self.scheduler.set_timesteps(num_inversion_steps, device=device)    # 決定 diffusion 時間序列。
         timesteps = self.scheduler.timesteps
 
         # Encode the input image with the first stage model
@@ -89,6 +89,7 @@ class DDIMInversion(BasePipeline):
             x0_dec = self.decode_latents(x0_enc.detach())
         image_x0_dec = self.numpy_to_pil(x0_dec)
 
+        # with torch.no_grad(): 代表在這個區塊內「不建立計算圖、不追蹤梯度」，也就是只做純前向推論，不會進行反向傳播。
         with torch.no_grad():
             prompt_embeds = self._encode_prompt(prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt).to(device)
         extra_step_kwargs = self.prepare_extra_step_kwargs(None, eta)
