@@ -189,7 +189,8 @@ def prep_unet(unet):
     for name, params in unet.named_parameters():
         # requires_grad代表哪些參數可以被訓練更新
         # 改成self-attention跟cross-attention都可以訓練
-        if 'attn1' in name or 'attn2' in name:  
+        #if 'attn1' in name or 'attn2' in name:  
+        if 'attn2' in name:
             params.requires_grad = True
         else:
             params.requires_grad = False
