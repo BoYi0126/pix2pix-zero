@@ -203,8 +203,8 @@ class EditingPipeline(BasePipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 參考第一輪denoising的說明，code都一樣
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)    # 參考第一輪denoising的說明，code都一樣
 
-                # 前20%做優化
-                if i < int(len(timesteps) * 0.2):
+                # 前50%照樣用Loss做優化
+                if i < int(len(timesteps) * 0.5):
                     # 切斷舊的 computation graph，讓 x_in 成為全新的葉節點 (leaf tensor)，然後只對 x_in 做優化。
                     # clone() 只做：複製 tensor 的數值，但它 保留 gradient graph 連結。
                     # detach() 的意思是：把 tensor 從原本的 graph 中拔掉
@@ -240,13 +240,48 @@ class EditingPipeline(BasePipeline):
                         noise_pred = self.unet(x_in.detach(),t,encoder_hidden_states=prompt_embeds_edit,cross_attention_kwargs=cross_attention_kwargs,).sample
                     
                     latents = x_in.detach().chunk(2)[0]
-                else:
-                  with torch.no_grad():  
-                    # 預測噪音
-                    noise_pred = self.unet(latent_model_input,
-                                           t,
-                                           encoder_hidden_states=prompt_embeds_edit.detach(),
-                                           cross_attention_kwargs=cross_attention_kwargs,).sample
+                else:   # 剩餘的部分這邊想改成使用self-attention
+                    self_attenation_enable = 0
+                    if self_attenation_enable == 1:
+                        with torch.no_grad():  
+                            # 預測噪音
+                            noise_pred = self.unet(latent_model_input,
+                                                t,
+                                                encoder_hidden_states=prompt_embeds_edit.detach(),
+                                                cross_attention_kwargs=cross_attention_kwargs,).sample
+                    else:
+                        x_in = latent_model_input.detach().clone()
+                        x_in.requires_grad = True
+                        opt = torch.optim.SGD([x_in], lr=guidance_amount)
+
+                        noise_pred = self.unet(
+                            x_in,
+                            t,
+                            encoder_hidden_states=prompt_embeds_edit.detach(),
+                            cross_attention_kwargs=cross_attention_kwargs,
+                        ).sample
+
+                        loss = 0.0
+                        for name, module in self.unet.named_modules():
+                            module_name = type(module).__name__
+                            if module_name == "CrossAttention" and 'attn1' in name:
+                                curr = module.attn_probs
+                                ref = d_ref_t2attn[t.item()][name].detach().to(device)
+                                loss += ((curr - ref) ** 2).sum((1, 2)).mean(0)
+
+                        loss.backward()
+                        opt.step()
+
+                        with torch.no_grad():
+                            noise_pred = self.unet(
+                                x_in.detach(),
+                                t,
+                                encoder_hidden_states=prompt_embeds_edit,
+                                cross_attention_kwargs=cross_attention_kwargs,
+                            ).sample
+
+                        latents = x_in.detach().chunk(2)[0]
+                        
                             
                 # perform guidance
                 # 跟第一個迴圈code一樣
