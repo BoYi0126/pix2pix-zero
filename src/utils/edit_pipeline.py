@@ -7,6 +7,7 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 sys.path.insert(0, "src/utils")
 from base_pipeline import BasePipeline
 from cross_attention import prep_unet
+import json
 
 
 if torch.cuda.is_available():
@@ -48,6 +49,7 @@ class EditingPipeline(BasePipeline):
         # 1. setup all caching objects
         # 是 timestep → layer → attention map 的對應表。
         d_ref_t2attn = {} # reference cross attention maps
+        d_ref_t1attn = {} # reference cross attention maps
         
         # 2. Default height and width to unet
         # 因為diffusion在latent space運作，latent = H/8 x W/8
@@ -72,6 +74,15 @@ class EditingPipeline(BasePipeline):
         # text → tokenizer → text_encoder → embedding → UNet cross-attention (Stable Diffusion 並不是把文字直接丟進 UNet。)
         prompt_embeds = self._encode_prompt( prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt, prompt_embeds=prompt_embeds, negative_prompt_embeds=negative_prompt_embeds,)
 
+        # 取得對應的 noise schedule
+        sigmas = None
+        alphas_cumprod = None
+        if hasattr(self.scheduler, "sigmas"):
+            sigmas = self.scheduler.sigmas
+        else:
+            # fallback: 用 alphas_cumprod 計算 noise 強度
+            alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
+    
         # 4. Prepare timesteps
         # 建立diffusion timesteps，這決定x_t -> x_0的反向去噪順序
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -115,6 +126,7 @@ class EditingPipeline(BasePipeline):
 
                     # add the cross attention map to the dictionary
                     d_ref_t2attn[t.item()] = {} # 建立timestep的容器，t.item()是轉成整數，d_ref_t2attn是字典 (等於是為了目前的timestep建立一個空的attention儲存空間)
+                    d_ref_t1attn[t.item()] = {} # 建立timestep的容器，t.item()是轉成整數，d_ref_t2attn是字典 (等於是為了目前的timestep建立一個空的attention儲存空間)
                     '''
                     結構如下
                     d_ref_t2attn = {
@@ -149,6 +161,10 @@ class EditingPipeline(BasePipeline):
                             }
                             '''
                             d_ref_t2attn[t.item()][name] = attn_mask.detach().cpu()
+                            
+                        if module_name == "CrossAttention" and 'attn2' in name:
+                            attn_mask = module.attn_probs # size is num_channel,s*s,77
+                            d_ref_t1attn[t.item()][name] = attn_mask.detach().cpu()
 
                     # perform guidance
                     # 做CFG (放大條件方向)
@@ -194,17 +210,51 @@ class EditingPipeline(BasePipeline):
         latents = latents_init
         
         # Second denoising loop for editing the text prompt
+        sigma_record = [] # 紀錄每個timestep的noise強度，方便後面分析
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        # 取得Tau，這是用來區分高噪聲和低噪聲的閾值，在高噪聲階段使用Loss優化，在低噪聲階段正常去噪
+        noise_threshold = 0.5 # 這個值是經過實驗調整的，代表在noise強度超過這個值的階段，我們認為是高噪聲階段，適合用Loss優化
+        tau_method = "median" # 這個值是經過實驗調整的，代表用來計算tau的方法，"value_percent"代表用噪聲強度，"median"代表用noise schedule的中位數
+        if tau_method == "value_percent":
+            if hasattr(self.scheduler, "sigmas"):
+                tau = sigmas.max() * noise_threshold   # 高噪聲前半段
+            else:
+                tau = torch.sqrt(1 - alphas_cumprod.min()) * noise_threshold
+        elif tau_method == "median":
+            if hasattr(self.scheduler, "sigmas"):
+                tau = torch.quantile(sigmas, 0.5)
+            else:
+                sigma_all = torch.sqrt(1 - alphas_cumprod)
+                tau = torch.quantile(sigma_all, 0.5)
+                
         with self.progress_bar(total=num_inference_steps) as progress_bar:# 建立一個進度條物件，在diffusion迴圈中顯示目前的執行進度
             # 在迭代的同時取得索引i以及元素t，實際的timesteps可能是: tensor([999, 979, 959, ..., 19, 0])
             # 所以第一個元素是 i=0, t=999，第二個是i=1, t=979, ...
             for i, t in enumerate(timesteps):
+                
+
+                # 取得目前 timestep 的 noise 強度
+                if hasattr(self.scheduler, "sigmas"):
+                    sigma_t = sigmas[i]
+                else:
+                    alpha_t = alphas_cumprod[t]
+                    sigma_t = torch.sqrt(1 - alpha_t)
+                
+                # 儲存sigma的資訊 後面方便比對
+                sigma_record.append({
+                    "step_index": i,
+                    "timestep": int(t.item()),
+                    "sigma": float(sigma_t.detach().cpu().item())
+                })
+                
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 參考第一輪denoising的說明，code都一樣
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)    # 參考第一輪denoising的說明，code都一樣
-
+                    
                 # 前50%照樣用Loss做優化
-                if i < int(len(timesteps) * 0.5):
+                #if i < int(len(timesteps) * 0.5):
+                if sigma_t > tau:
                     # 切斷舊的 computation graph，讓 x_in 成為全新的葉節點 (leaf tensor)，然後只對 x_in 做優化。
                     # clone() 只做：複製 tensor 的數值，但它 保留 gradient graph 連結。
                     # detach() 的意思是：把 tensor 從原本的 graph 中拔掉
@@ -242,7 +292,7 @@ class EditingPipeline(BasePipeline):
                     latents = x_in.detach().chunk(2)[0]
                 else:   # 剩餘的部分這邊想改成使用self-attention
                     self_attenation_enable = 0
-                    if self_attenation_enable == 1:
+                    if self_attenation_enable == 0:
                         with torch.no_grad():  
                             # 預測噪音
                             noise_pred = self.unet(latent_model_input,
@@ -266,7 +316,7 @@ class EditingPipeline(BasePipeline):
                             module_name = type(module).__name__
                             if module_name == "CrossAttention" and 'attn1' in name:
                                 curr = module.attn_probs
-                                ref = d_ref_t2attn[t.item()][name].detach().to(device)
+                                ref = d_ref_t1attn[t.item()][name].detach().to(device)
                                 loss += ((curr - ref) ** 2).sum((1, 2)).mean(0)
 
                         loss.backward()
@@ -305,6 +355,10 @@ class EditingPipeline(BasePipeline):
 
         # 10. Convert to PIL
         image_edit = self.numpy_to_pil(image)
+
+        # 將sigma儲存成檔案
+        with open("sigma_log.json", "w") as f:
+            json.dump(sigma_record, f, indent=4)
 
 
         return image_rec, image_edit
