@@ -162,9 +162,14 @@ class EditingPipeline(BasePipeline):
                             '''
                             d_ref_t2attn[t.item()][name] = attn_mask.detach().cpu()
                             
-                        if module_name == "CrossAttention" and 'attn2' in name:
-                            attn_mask = module.attn_probs # size is num_channel,s*s,77
-                            d_ref_t1attn[t.item()][name] = attn_mask.detach().cpu()
+                        # attn_probs是每個token對所有token的注意力權重分布
+                        # 在latent resolution 64*64的時候，在self-attention中:attn_probs.shape = (batch_size, num_heads, tokens, tokens)，具體是(B, H, 4096, 4096)
+                        # mean(1)是在對num_heads維度取平均，通常會少了8倍，但是精細控制的部分會沒那麼好
+                        if module_name == "CrossAttention" and 'attn1' in name:
+                            if 'down_blocks.0' in name:
+                                #attn_mask = module.attn_probs.mean(1) # average heads
+                                attn_mask = module.attn_probs.mean((1,2)) # 平均num_heads跟第一個tokens的維度
+                                d_ref_t1attn[t.item()][name] = attn_mask.detach().cpu()
 
                     # perform guidance
                     # 做CFG (放大條件方向)
@@ -213,20 +218,23 @@ class EditingPipeline(BasePipeline):
         sigma_record = [] # 紀錄每個timestep的noise強度，方便後面分析
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
+        # 第二輪的去噪過程要使用哪些流程
+        use_loss_by_noise_level = 1 # 這個值是經過實驗調整的，代表是否根據noise level來決定是否使用loss優化，1代表有，0代表沒有
+        
         # 取得Tau，這是用來區分高噪聲和低噪聲的閾值，在高噪聲階段使用Loss優化，在低噪聲階段正常去噪
-        noise_threshold = 0.5 # 這個值是經過實驗調整的，代表在noise強度超過這個值的階段，我們認為是高噪聲階段，適合用Loss優化
+        noise_level_threshold = 0.5 # 這個值是經過實驗調整的，代表在noise強度超過這個值的階段，我們認為是高噪聲階段，適合用Loss優化
         tau_method = "median" # 這個值是經過實驗調整的，代表用來計算tau的方法，"value_percent"代表用噪聲強度，"median"代表用noise schedule的中位數
         if tau_method == "value_percent":
             if hasattr(self.scheduler, "sigmas"):
-                tau = sigmas.max() * noise_threshold   # 高噪聲前半段
+                tau = sigmas.max() * noise_level_threshold   # 高噪聲前半段
             else:
-                tau = torch.sqrt(1 - alphas_cumprod.min()) * noise_threshold
+                tau = torch.sqrt(1 - alphas_cumprod.min()) * noise_level_threshold
         elif tau_method == "median":
             if hasattr(self.scheduler, "sigmas"):
-                tau = torch.quantile(sigmas, 0.5)
+                tau = torch.quantile(sigmas, noise_level_threshold)
             else:
                 sigma_all = torch.sqrt(1 - alphas_cumprod)
-                tau = torch.quantile(sigma_all, 0.5)
+                tau = torch.quantile(sigma_all, noise_level_threshold)
                 
         with self.progress_bar(total=num_inference_steps) as progress_bar:# 建立一個進度條物件，在diffusion迴圈中顯示目前的執行進度
             # 在迭代的同時取得索引i以及元素t，實際的timesteps可能是: tensor([999, 979, 959, ..., 19, 0])
@@ -252,9 +260,16 @@ class EditingPipeline(BasePipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 參考第一輪denoising的說明，code都一樣
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)    # 參考第一輪denoising的說明，code都一樣
                     
-                # 前50%照樣用Loss做優化
+                
+                judge_use_loss = 0
+                
+                if use_loss_by_noise_level == 1:    # 使用noise level來決定是否使用loss優化，這樣可以讓模型在高噪聲階段專注於學習語意編輯，在低噪聲階段專注於細節還原
+                    judge_use_loss = sigma_t > tau 
+                else:   # 使用timestep index來決定是否使用loss優化，這樣可以確保在前半段的迴圈使用loss優化，在後半段的迴圈正常去噪
+                    judge_use_loss = i < int(len(timesteps) * 0.5)
                 #if i < int(len(timesteps) * 0.5):
-                if sigma_t > tau:
+                #if sigma_t > tau:
+                if judge_use_loss == 1:
                     # 切斷舊的 computation graph，讓 x_in 成為全新的葉節點 (leaf tensor)，然後只對 x_in 做優化。
                     # clone() 只做：複製 tensor 的數值，但它 保留 gradient graph 連結。
                     # detach() 的意思是：把 tensor 從原本的 graph 中拔掉
@@ -279,9 +294,11 @@ class EditingPipeline(BasePipeline):
                     for name, module in self.unet.named_modules():
                         module_name = type(module).__name__
                         if module_name == "CrossAttention" and 'attn2' in name:
-                            curr = module.attn_probs # size is num_channel,s*s,77
-                            ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
-                            loss += ((curr-ref)**2).sum((1,2)).mean(0)
+                            if 'down_blocks.0' in name:
+                                #curr = module.attn_probs.mean(1) 
+                                curr = module.attn_probs.mean((1,2)) 
+                                ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
+                                loss += ((curr-ref)**2).sum((1,2)).mean(0)
                     loss.backward(retain_graph=False)
                     opt.step()
 
@@ -317,11 +334,12 @@ class EditingPipeline(BasePipeline):
                             if module_name == "CrossAttention" and 'attn1' in name:
                                 curr = module.attn_probs
                                 ref = d_ref_t1attn[t.item()][name].detach().to(device)
-                                loss += ((curr - ref) ** 2).sum((1, 2)).mean(0)
+                                loss += ((curr - ref) ** 2).mean()
 
                         loss.backward()
                         opt.step()
 
+                        # recompute the noise
                         with torch.no_grad():
                             noise_pred = self.unet(
                                 x_in.detach(),
