@@ -294,11 +294,9 @@ class EditingPipeline(BasePipeline):
                     for name, module in self.unet.named_modules():
                         module_name = type(module).__name__
                         if module_name == "CrossAttention" and 'attn2' in name:
-                            if 'down_blocks.0' in name:
-                                #curr = module.attn_probs.mean(1) 
-                                curr = module.attn_probs.mean((1,2)) 
-                                ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
-                                loss += ((curr-ref)**2).sum((1,2)).mean(0)
+                            curr = module.attn_probs # size is num_channel,s*s,77
+                            ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
+                            loss += ((curr-ref)**2).sum((1,2)).mean(0)
                     loss.backward(retain_graph=False)
                     opt.step()
 
@@ -332,9 +330,10 @@ class EditingPipeline(BasePipeline):
                         for name, module in self.unet.named_modules():
                             module_name = type(module).__name__
                             if module_name == "CrossAttention" and 'attn1' in name:
-                                curr = module.attn_probs
-                                ref = d_ref_t1attn[t.item()][name].detach().to(device)
-                                loss += ((curr - ref) ** 2).mean()
+                                if 'down_blocks.0' in name:
+                                    curr = module.attn_probs.mean((1,2)) 
+                                    ref = d_ref_t1attn[t.item()][name].detach().to(device)
+                                    loss += ((curr - ref) ** 2).mean()
 
                         loss.backward()
                         opt.step()
