@@ -1,3 +1,4 @@
+from cmath import sqrt
 import pdb, sys
 
 import numpy as np
@@ -8,6 +9,7 @@ sys.path.insert(0, "src/utils")
 from base_pipeline import BasePipeline
 from cross_attention import prep_unet
 import json
+import csv
 
 
 if torch.cuda.is_available():
@@ -147,7 +149,7 @@ class EditingPipeline(BasePipeline):
                             # 77: CLIP text token數
                             # 這代表每個 spatial 位置 對 每個文字 token 的注意力權重
                             attn_mask = module.attn_probs # size is num_channel,s*s,77
-                            
+                            #print(f"timestep {t.item()} | cross block name: {name} | attn shape: {module.attn_probs.shape}")
                             # detach(): 把它從 computational graph 拔掉 → 不會參與梯度回傳，代表這只是記錄 reference attention
                             # cpu(): 把 tensor 移到 CPU → 節省 GPU 記憶體
                             # 存到dict，最後結構會像這樣
@@ -167,9 +169,13 @@ class EditingPipeline(BasePipeline):
                         # mean(1)是在對num_heads維度取平均，通常會少了8倍，但是精細控制的部分會沒那麼好
                         if module_name == "CrossAttention" and 'attn1' in name:
                             if 'down_blocks.0' in name:
-                                #attn_mask = module.attn_probs.mean(1) # average heads
-                                attn_mask = module.attn_probs.mean((1,2)) # 平均num_heads跟第一個tokens的維度
-                                d_ref_t1attn[t.item()][name] = attn_mask.detach().cpu()
+                            #attn_mask = module.attn_probs.mean(1) # average heads
+                                attn_mask = module.attn_probs   # (16, 4096, 4096)
+                                attn_mask = attn_mask.mean(0)   # 平均 head → (4096, 4096)
+                                k=77
+                                topk_vals, topk_idx = torch.topk(attn_mask, k, dim=-1)  # (4096, k)
+                                #print(f"timestep {t.item()} | self block name: {name} | topk_vals shape: {topk_vals.shape}")
+                                d_ref_t1attn[t.item()][name] = topk_vals.detach().cpu()
 
                     # perform guidance
                     # 做CFG (放大條件方向)
@@ -215,14 +221,15 @@ class EditingPipeline(BasePipeline):
         latents = latents_init
         
         # Second denoising loop for editing the text prompt
-        sigma_record = [] # 紀錄每個timestep的noise強度，方便後面分析
+        timestep_param_record = [] # 紀錄每個timestep的參數，方便後面分析
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # 第二輪的去噪過程要使用哪些流程
         use_loss_by_noise_level = 1 # 這個值是經過實驗調整的，代表是否根據noise level來決定是否使用loss優化，1代表有，0代表沒有
-        
+        self_attenation_enable = 0  # 設定第二輪是否要使用self-attention來做Loss優化
+
         # 取得Tau，這是用來區分高噪聲和低噪聲的閾值，在高噪聲階段使用Loss優化，在低噪聲階段正常去噪
-        noise_level_threshold = 0.5 # 這個值是經過實驗調整的，代表在noise強度超過這個值的階段，我們認為是高噪聲階段，適合用Loss優化
+        noise_level_threshold = 0.4 # 這個值是經過實驗調整的，代表在noise強度超過這個值的階段，我們認為是高噪聲階段，適合用Loss優化
         tau_method = "median" # 這個值是經過實驗調整的，代表用來計算tau的方法，"value_percent"代表用噪聲強度，"median"代表用noise schedule的中位數
         if tau_method == "value_percent":
             if hasattr(self.scheduler, "sigmas"):
@@ -241,35 +248,32 @@ class EditingPipeline(BasePipeline):
             # 所以第一個元素是 i=0, t=999，第二個是i=1, t=979, ...
             for i, t in enumerate(timesteps):
                 
-
                 # 取得目前 timestep 的 noise 強度
                 if hasattr(self.scheduler, "sigmas"):
-                    sigma_t = sigmas[i]
+                  sigma_t = sigmas[i]
+                  alpha_t = 1 - sigma_t**2
                 else:
-                    alpha_t = alphas_cumprod[t]
-                    sigma_t = torch.sqrt(1 - alpha_t)
+                  alpha_t = alphas_cumprod[t] # 正向訊號強度
+                  sigma_t = torch.sqrt(1 - alpha_t)   # 噪聲強度
                 
-                # 儲存sigma的資訊 後面方便比對
-                sigma_record.append({
-                    "step_index": i,
-                    "timestep": int(t.item()),
-                    "sigma": float(sigma_t.detach().cpu().item())
-                })
+                # 取得SNR
+                snr_t = alpha_t / (1 - alpha_t + 1e-8)
+                lambda_t = (snr_t / (snr_t + 1)) # 早期的噪聲強度很高，SNR很低，所以lambda_t會接近0，代表loss的權重很小；隨著timestep降低，噪聲強度降低，SNR提高，lambda_t會接近1，代表loss的權重提高
+                
+                
                 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 參考第一輪denoising的說明，code都一樣
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)    # 參考第一輪denoising的說明，code都一樣
                     
+                # 先使用self-attention再使用cross-attention，因為self-attention適合高噪聲(充滿結構訊息)
                 
-                judge_use_loss = 0
-                
+                use_self_loss = 0  # 是否要使用self attention計算出來的Loss來優化latent，1代表有，0代表沒有       
                 if use_loss_by_noise_level == 1:    # 使用noise level來決定是否使用loss優化，這樣可以讓模型在高噪聲階段專注於學習語意編輯，在低噪聲階段專注於細節還原
-                    judge_use_loss = sigma_t > tau 
-                else:   # 使用timestep index來決定是否使用loss優化，這樣可以確保在前半段的迴圈使用loss優化，在後半段的迴圈正常去噪
-                    judge_use_loss = i < int(len(timesteps) * 0.5)
-                #if i < int(len(timesteps) * 0.5):
-                #if sigma_t > tau:
-                if judge_use_loss == 1:
+                    use_cross_loss = sigma_t > tau 
+                
+                use_self_loss = 1 
+                if use_self_loss == 1:
                     # 切斷舊的 computation graph，讓 x_in 成為全新的葉節點 (leaf tensor)，然後只對 x_in 做優化。
                     # clone() 只做：複製 tensor 的數值，但它 保留 gradient graph 連結。
                     # detach() 的意思是：把 tensor 從原本的 graph 中拔掉
@@ -290,6 +294,66 @@ class EditingPipeline(BasePipeline):
                                         cross_attention_kwargs=cross_attention_kwargs,).sample
                     
                     # 讓這輪的cross-attention接近第一輪的cross-attention
+                    loss_self = 0.0
+                    loss_cross = 0.0
+                    
+                    for name, module in self.unet.named_modules():
+                        module_name = type(module).__name__
+                        
+
+                        # Self-attention的loss
+                        if module_name == "CrossAttention" and 'attn1' in name:
+                            if 'down_blocks.0' in name:
+                                curr = module.attn_probs.mean(0)    # (1, 8, 4096, 4096) -> (1, 4096, 4096)
+                                k=77
+                                curr_topk_vals, curr_topk_idx = torch.topk(curr, k, dim=-1) # topk_vals : (4096, k), topk_idx  : (4096, k), 每個 query token只保留 attention 最大的 k 個 key
+                                ref_topk_vals = d_ref_t1attn[t.item()][name].detach().to(device)  # 取得第一輪的存的topK values
+                                #ref = ref.mean(1).squeeze(0)
+                                #ref_topk = torch.topk(ref, k, dim=-1)[0]
+                                
+                                loss_self += ((topk_vals - ref_topk_vals) ** 2).sum((0,1))
+                                print_enable = 0
+                                if print_enable == 1:
+                                    print("-------------Check Self Shape-------------")
+                                    print(curr_topk_vals.shape)   # torch.Size([4096, 77])
+                                    print(ref_topk_vals.shape)  # torch.Size([4096, 77])
+                        
+
+                        # Cross-attention的loss
+                        if module_name == "CrossAttention" and 'attn2' in name:
+                            curr = module.attn_probs # size is (16, 4096, 77)
+                            ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
+                            loss_cross += ((curr-ref)**2).sum((1,2)).mean(0)
+                            
+                            # 印出大小
+                            print_enable = 0
+                            if print_enable == 1:
+                                print("-------------Check Cross Shape-------------")
+                                print(curr.shape)   # torch.Size([16, 4096, 77])
+                                print(ref.shape)    # torch.Size([16, 4096, 77])
+                                print(((curr-ref)**2).shape)    # torch.Size([16, 4096, 77])
+                                print(((curr-ref)**2).sum((1,2)).shape) # torch.Size([16])
+                                print(((curr-ref)**2).sum((1,2)).mean(0).shape) # torch.Size([]) 代表一個純量
+                                tmp_1 = (curr-ref)**2
+                                tmp_1 = tmp_1.sum((1,2))
+                                tmp_1 = tmp_1.mean(0)
+                                tmp_2 = ((curr-ref)**2)
+                                tmp_2 = tmp_2.mean(0)
+                                tmp_2 = tmp_2.sum((0,1))
+                                print(tmp_1)
+                                print(tmp_2)
+                                
+                           
+                    loss_alpha = 0.0
+                    if i < 10:
+                        loss_alpha = 0.0
+                    elif i < 30:
+                        loss_alpha = 0.3
+                    else:
+                        loss_alpha = 1
+                    loss_alpha = 0.6
+                    loss_total = loss_alpha*loss_cross + (1-loss_alpha)*loss_self
+                    
                     loss = 0.0
                     for name, module in self.unet.named_modules():
                         module_name = type(module).__name__
@@ -297,6 +361,23 @@ class EditingPipeline(BasePipeline):
                             curr = module.attn_probs # size is num_channel,s*s,77
                             ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
                             loss += ((curr-ref)**2).sum((1,2)).mean(0)
+                            #loss += ((curr-ref)**2).mean(0) # 這是另一種算法，是真正的MSE
+                    
+                    
+                    # 儲存sigma的資訊 後面方便比對
+                    timestep_param_record.append({
+                        "step_index": i,
+                        "timestep": int(t.item()),
+                        "sigma": float(sigma_t.detach().cpu().item()),
+                        "lambda": float(lambda_t.detach().cpu().item()),
+                        "loss": float(loss.detach().cpu().item()),
+                        "loss_alpha": float(loss_alpha),
+                        "loss_cross": float(loss_cross),
+                        "loss_self": float(loss_self),
+                        "loss_total": float(loss_total)
+                    })
+                    
+                    loss = loss_total
                     loss.backward(retain_graph=False)
                     opt.step()
 
@@ -305,8 +386,7 @@ class EditingPipeline(BasePipeline):
                         noise_pred = self.unet(x_in.detach(),t,encoder_hidden_states=prompt_embeds_edit,cross_attention_kwargs=cross_attention_kwargs,).sample
                     
                     latents = x_in.detach().chunk(2)[0]
-                else:   # 剩餘的部分這邊想改成使用self-attention
-                    self_attenation_enable = 0
+                else: 
                     if self_attenation_enable == 0:
                         with torch.no_grad():  
                             # 預測噪音
@@ -372,10 +452,13 @@ class EditingPipeline(BasePipeline):
 
         # 10. Convert to PIL
         image_edit = self.numpy_to_pil(image)
-
-        # 將sigma儲存成檔案
-        with open("sigma_log.json", "w") as f:
-            json.dump(sigma_record, f, indent=4)
-
+        
+        # 將 timestep_param_record 存成 CSV
+        csv_file = "timestep_param_log.csv"
+        with open(csv_file, mode="w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["step_index", "timestep", "sigma", "lambda", "loss", "loss_alpha", "loss_cross", "loss_self", "loss_total"])
+            writer.writeheader()  # 寫入欄位名稱
+            for record in timestep_param_record:
+                writer.writerow(record)
 
         return image_rec, image_edit
