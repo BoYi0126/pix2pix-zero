@@ -52,6 +52,11 @@ class EditingPipeline(BasePipeline):
         # 是 timestep → layer → attention map 的對應表。
         d_ref_t2attn = {} # reference cross attention maps
         d_ref_t1attn = {} # reference cross attention maps
+        self_block_name = 'down_blocks.0'
+        #self_block_name = 'up_blocks.1.attentions.0'
+        #self_block_name = 'mid_blocks'
+        top_k_enable = 1
+        self_top_k = 77
         
         # 2. Default height and width to unet
         # 因為diffusion在latent space運作，latent = H/8 x W/8
@@ -168,14 +173,18 @@ class EditingPipeline(BasePipeline):
                         # 在latent resolution 64*64的時候，在self-attention中:attn_probs.shape = (batch_size, num_heads, tokens, tokens)，具體是(B, H, 4096, 4096)
                         # mean(1)是在對num_heads維度取平均，通常會少了8倍，但是精細控制的部分會沒那麼好
                         if module_name == "CrossAttention" and 'attn1' in name:
-                            if 'down_blocks.0' in name:
+                            #print(f"timestep {t.item()} | self block name: {name} | shape: {module.attn_probs.shape}")
+                            #if 'down_blocks.0' in name:
+                            if self_block_name in name:
                             #attn_mask = module.attn_probs.mean(1) # average heads
                                 attn_mask = module.attn_probs   # (16, 4096, 4096)
                                 attn_mask = attn_mask.mean(0)   # 平均 head → (4096, 4096)
-                                k=77
-                                topk_vals, topk_idx = torch.topk(attn_mask, k, dim=-1)  # (4096, k)
-                                #print(f"timestep {t.item()} | self block name: {name} | topk_vals shape: {topk_vals.shape}")
-                                d_ref_t1attn[t.item()][name] = topk_vals.detach().cpu()
+                                if top_k_enable == 1:
+                                    k=self_top_k
+                                    topk_vals, topk_idx = torch.topk(attn_mask, k, dim=-1)  # (4096, k)
+                                    d_ref_t1attn[t.item()][name] = topk_vals.detach().cpu()
+                                else:
+                                    d_ref_t1attn[t.item()][name] = attn_mask.detach().cpu()
 
                     # perform guidance
                     # 做CFG (放大條件方向)
@@ -257,10 +266,11 @@ class EditingPipeline(BasePipeline):
                   sigma_t = torch.sqrt(1 - alpha_t)   # 噪聲強度
                 
                 # 取得SNR
-                snr_t = alpha_t / (1 - alpha_t + 1e-8)
-                lambda_t = (snr_t / (snr_t + 1)) # 早期的噪聲強度很高，SNR很低，所以lambda_t會接近0，代表loss的權重很小；隨著timestep降低，噪聲強度降低，SNR提高，lambda_t會接近1，代表loss的權重提高
-                
-                
+                #snr_t = alpha_t / (1 - alpha_t + 1e-8)
+                #lambda_t = (snr_t / (snr_t + 1)) # 早期的噪聲強度很高，SNR很低，所以lambda_t會接近0，代表loss的權重很小；隨著timestep降低，噪聲強度降低，SNR提高，lambda_t會接近1，代表loss的權重提高
+          
+                snr_t = (1-sigma_t**2) / (sigma_t**2 + 1e-8)    # 避免sigma_t為0的情況
+                lambda_t = (snr_t / (snr_t + 0.005)) # 目前這個權重是可以的，只是結果還要tuning
                 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents # 參考第一輪denoising的說明，code都一樣
@@ -303,21 +313,24 @@ class EditingPipeline(BasePipeline):
 
                         # Self-attention的loss
                         if module_name == "CrossAttention" and 'attn1' in name:
-                            if 'down_blocks.0' in name:
+                            #if 'down_blocks.0' in name:
+                            if self_block_name in name:
                                 curr = module.attn_probs.mean(0)    # (1, 8, 4096, 4096) -> (1, 4096, 4096)
-                                k=77
-                                curr_topk_vals, curr_topk_idx = torch.topk(curr, k, dim=-1) # topk_vals : (4096, k), topk_idx  : (4096, k), 每個 query token只保留 attention 最大的 k 個 key
-                                ref_topk_vals = d_ref_t1attn[t.item()][name].detach().to(device)  # 取得第一輪的存的topK values
-                                #ref = ref.mean(1).squeeze(0)
-                                #ref_topk = torch.topk(ref, k, dim=-1)[0]
+                                if top_k_enable == 1:
+                                    k=self_top_k
+                                    curr_topk_vals, curr_topk_idx = torch.topk(curr, k, dim=-1) # topk_vals : (4096, k), topk_idx  : (4096, k), 每個 query token只保留 attention 最大的 k 個 key
+                                    ref_topk_vals = d_ref_t1attn[t.item()][name].detach().to(device)  # 取得第一輪的存的topK values
                                 
-                                loss_self += ((topk_vals - ref_topk_vals) ** 2).sum((0,1))
-                                print_enable = 0
-                                if print_enable == 1:
-                                    print("-------------Check Self Shape-------------")
-                                    print(curr_topk_vals.shape)   # torch.Size([4096, 77])
-                                    print(ref_topk_vals.shape)  # torch.Size([4096, 77])
-                        
+                                    loss_self += ((topk_vals - ref_topk_vals) ** 2).sum((0,1))
+                                    print_enable = 0
+                                    if print_enable == 1:
+                                        print("-------------Check Self Shape-------------")
+                                        print(curr_topk_vals.shape)   # torch.Size([4096, 77])
+                                        print(ref_topk_vals.shape)  # torch.Size([4096, 77])
+                                else:
+                                    curr = module.attn_probs # size is (16, s*s, s*s)
+                                    ref = d_ref_t2attn[t.item()][name].detach().to(device)  # 取得第一輪的attention map
+                                    loss_self += ((curr-ref)**2).sum((1,2)).mean(0)
 
                         # Cross-attention的loss
                         if module_name == "CrossAttention" and 'attn2' in name:
@@ -342,17 +355,8 @@ class EditingPipeline(BasePipeline):
                                 tmp_2 = tmp_2.sum((0,1))
                                 print(tmp_1)
                                 print(tmp_2)
-                                
-                           
-                    loss_alpha = 0.0
-                    if i < 10:
-                        loss_alpha = 0.0
-                    elif i < 30:
-                        loss_alpha = 0.3
-                    else:
-                        loss_alpha = 1
-                    loss_alpha = 0.6
-                    loss_total = loss_alpha*loss_cross + (1-loss_alpha)*loss_self
+                                   
+                    loss_total = lambda_t*loss_cross + (1-lambda_t)*loss_self
                     
                     loss = 0.0
                     for name, module in self.unet.named_modules():
@@ -368,10 +372,11 @@ class EditingPipeline(BasePipeline):
                     timestep_param_record.append({
                         "step_index": i,
                         "timestep": int(t.item()),
-                        "sigma": float(sigma_t.detach().cpu().item()),
-                        "lambda": float(lambda_t.detach().cpu().item()),
+                        "alpha_t": float(alpha_t),
+                        "sigma_t": float(sigma_t),
+                        "snr_t": float(snr_t.detach().cpu().item()),
+                        "lambda": float(lambda_t),
                         "loss": float(loss.detach().cpu().item()),
-                        "loss_alpha": float(loss_alpha),
                         "loss_cross": float(loss_cross),
                         "loss_self": float(loss_self),
                         "loss_total": float(loss_total)
@@ -456,7 +461,7 @@ class EditingPipeline(BasePipeline):
         # 將 timestep_param_record 存成 CSV
         csv_file = "timestep_param_log.csv"
         with open(csv_file, mode="w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["step_index", "timestep", "sigma", "lambda", "loss", "loss_alpha", "loss_cross", "loss_self", "loss_total"])
+            writer = csv.DictWriter(f, fieldnames=["step_index", "timestep", "alpha_t", "sigma_t", "snr_t", "lambda", "loss", "loss_cross", "loss_self", "loss_total"])
             writer.writeheader()  # 寫入欄位名稱
             for record in timestep_param_record:
                 writer.writerow(record)
